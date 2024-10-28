@@ -1,0 +1,97 @@
+--Suppose we have:
+
+--Shops identified by a unique shop_id.
+--A feature (e.g., "is_super_shop" or any other boolean attribute) whose state we want to track over time for each shop.
+--A log of feature changes stored in a table called table_with_features_log, where every state change of the feature is recorded along with a timestamp. Each log entry includes:
+--shop_id: the identifier of the shop.
+--created_at: the timestamp when the feature state change occurred.
+--city: city where shop is placed
+--field: the name of the feature (e.g., "feature" or "is_super_shop").
+--new_value: the new state of the feature (typically 1 for active or 0 for inactive).
+--Objective:
+--We want to calculate the total time each shop had the feature active on a daily basis. To achieve this, we:
+
+--Generate continuous minute-level timestamps between each feature state change.
+--Use these timestamps to track the daily duration (in hours) that the feature was active for each shop.
+
+
+
+
+WITH initial_log AS (
+    -- Extract the initial log data, truncating the timestamp and determining feature status
+    SELECT 
+        shop_id,
+        DATE_TRUNC('minute', CAST(created_at AS TIMESTAMP)) AS event_date,
+        MAX(new_value) AS feature
+    FROM 
+        table_with_features_log
+    WHERE 
+        field = 'feature'  -- Specify the feature to track
+    GROUP BY 
+        shop_id, event_date
+),
+
+expanded_dates AS (
+    -- Add a row with the current timestamp for each shop to cover the full date range
+    SELECT 
+        shop_id, event_date, feature
+    FROM 
+        initial_log
+    UNION DISTINCT
+    SELECT 
+        shop_id,
+        CAST(current_date - INTERVAL '1' minute AS TIMESTAMP) AS event_date,
+        NULL AS feature
+    FROM 
+        initial_log
+),
+
+filled_gaps AS (
+    -- Fill in any NULL values in the feature column by carrying forward the last known value
+    SELECT 
+        shop_id,
+        event_date,
+        COALESCE(feature, LAG(feature) OVER (PARTITION BY shop_id ORDER BY event_date)) AS feature
+    FROM 
+        expanded_dates
+),
+
+date_ranges AS (
+    -- Calculate previous and next event dates to set up time intervals per shop
+    SELECT 
+        shop_id,
+        LAG(event_date) OVER (PARTITION BY shop_id ORDER BY event_date) AS previous_date,
+        event_date AS current_date,
+        LEAD(event_date) OVER (PARTITION BY shop_id ORDER BY event_date) AS next_date,
+        feature
+    FROM 
+        filled_gaps
+),
+
+expanded_timestamps AS (
+    -- Generate minute-level timestamps between each shop's event intervals
+    SELECT 
+        shop_id,
+        feature,
+        GENERATE_TIMESTAMP_ARRAY(
+            current_date, 
+            COALESCE(next_date - INTERVAL '1' minute, current_date), 
+            INTERVAL '1' minute
+        ) AS timestamps
+    FROM 
+        date_ranges
+)
+
+-- Final calculation to summarize daily feature status for each shop
+SELECT 
+    CAST(dt AS DATE) AS date,
+    shop_id,
+    SUM(feature) / 60 AS hours_with_feature,  -- Total hours per day with the feature active
+    city AS shop_city
+FROM 
+    expanded_timestamps,
+    UNNEST(timestamps) AS dt
+GROUP BY 
+    date, shop_id, shop_city
+ORDER BY 
+    shop_id, date;
